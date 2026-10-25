@@ -5,8 +5,14 @@
 --   接收两个特殊按键 F11 / F12（一般由手柄映射软件或安卓模拟器注入），
 --   用来控制游戏的“鼠标视角”（Mouselook，等价于按住鼠标右键拖动视角）。
 --
+--   注意：F11 / F12 的映射由「按键映射」开关控制，**默认关闭**（不占用这两个键）。
+--   需要先在设置面板勾选，或输入 /msa bind 开启。
+--
 --      按 F11  -> 若当前不在鼠标视角，则开启（MouselookStart）
 --      按 F12  -> 关闭鼠标视角（MouselookStop）
+--
+--   另外提供一个「标记骷髅」功能（默认关闭，按键在设置面板里录制）：
+--   按一下把当前目标标记为骷髅（团队标记 8 号），需在小队 / 团队中生效。
 --
 --   另外提供一个「移动自动锁视角」功能（默认关闭，可用 /msa wasd 开关）：
 --   当玩家用 W/A/S/D 方向键开始移动时，若当前不在鼠标视角，则自动开启，
@@ -33,10 +39,40 @@ local STOP_KEY = "F12"
 local BTN_START = "MSA_Btn_F20"
 local BTN_STOP = "MSA_Btn_F21"
 
+-- 「标记骷髅」功能的隐藏按钮名与团队标记编号（8 = 骷髅）。
+local BTN_SKULL = "MSA_Btn_Skull"
+local SKULL_ICON = 8
+
+-- 「按键映射」开关：开启后才把 F11 / F12 绑到上面两个隐藏按钮上。
+-- 关闭时不占用这两个键（之前绑定过的会自动解绑），/msa start / stop 仍然可用。
+-- 可在设置面板勾选，或用 /msa bind 切换。**默认关闭**（首次安装不占用任何按键）。
+local keyMappingEnabled = false
+
 -- 「移动自动锁视角」开关：开启后，用 W/A/S/D 方向键开始移动时，
 -- 若当前不在鼠标视角，则自动开启。用 /msa wasd 切换。**默认关闭**。
--- 注意：这是本次运行内的临时开关，重载界面后会恢复为默认值。
+-- 该开关会写入存档，重载界面后保持上次的状态。
 local wasdAutoLock = false
+
+-- 「标记骷髅」功能：按一下把当前目标标记为指定编号的团队标记。
+-- 由独立开关控制，**默认关闭**；默认按键是 \（回车键上面那个键），默认 8 号（骷髅）。
+-- 按键与编号都可在设置面板里改。
+local SKULL_DEFAULT_KEY = "\\"
+local SKULL_ICON_DEFAULT = 8
+local skullEnabled = false
+local skullKey = SKULL_DEFAULT_KEY
+local skullIcon = SKULL_ICON_DEFAULT
+
+-- 1~8 号团队标记的形状说明（编号顺序与客户端一致）。
+local SKULL_ICON_NAMES = {
+	"1 - 星形（黄色五角星）",
+	"2 - 圆形（橙色圆环）",
+	"3 - 菱形（紫色菱形）",
+	"4 - 三角（绿色三角）",
+	"5 - 月亮（银白弯月）",
+	"6 - 方块（蓝色方块）",
+	"7 - 十字（红色叉形）",
+	"8 - 骷髅（白色骷髅头）",
+}
 
 -- WASD 本次“已锁定”标记：一旦通过方向键锁上视角，就把后续按键直接短路，
 -- 不再每次按键都调用 IsMouselooking() 判断，避免无谓的重复检查。
@@ -243,6 +279,29 @@ btnStop:SetScript("OnClick", function(_, button)
 end)
 
 ------------------------------------------------------------------
+-- 标记骷髅
+------------------------------------------------------------------
+-- 把当前目标标记为所选编号的团队标记（默认 8 = 骷髅）。
+-- 团队标记需要在小队 / 团队中才能生效；没有目标或单人时在这里提示，避免“按了没反应”。
+local function MarkTargetSkull()
+	if not UnitExists("target") then
+		Print("没有选中目标，无法标记")
+		return
+	end
+	if GetNumRaidMembers() == 0 and GetNumPartyMembers() == 0 then
+		Print("需在小队或团队中才能使用团队标记")
+		return
+	end
+	SetRaidTarget("target", skullIcon)
+end
+
+local btnSkull = CreateFrame("Button", BTN_SKULL)
+btnSkull:SetScript("OnClick", function(_, button)
+	MarkTargetSkull()
+	Debug("收到标记按键 " .. (skullKey or "(未设置)") .. "（" .. ClickText(button) .. "，编号: " .. skullIcon .. "）")
+end)
+
+------------------------------------------------------------------
 -- 移动自动锁视角（W/A/S/D 方向键）
 ------------------------------------------------------------------
 -- 思路（参考 ConsolePort 的实现）：不去重绑 W/A/S/D（那会破坏移动功能），
@@ -312,6 +371,118 @@ local function ApplyBindings()
 	SaveBindings(GetCurrentBindingSet())
 end
 
+-- 判断某个键当前是否仍指向本插件的按钮。
+-- 用于解绑前确认“这是自己占用的键”，避免误删玩家自己的按键绑定。
+local function IsOurBinding(key, btnName)
+	local action = GetBindingAction(key)
+	return action ~= nil and action ~= "" and string.find(action, btnName, 1, true) ~= nil
+end
+
+-- 解除单个键的绑定。SetBinding 的第二个参数传 nil 即为解绑；
+-- 个别客户端只认空串，这里补一次兜底。返回是否真的做过处理。
+local function UnbindKey(key, btnName)
+	if not IsOurBinding(key, btnName) then
+		return false
+	end
+	pcall(SetBinding, key, nil)
+	if IsOurBinding(key, btnName) then
+		pcall(SetBinding, key, "")
+	end
+	return true
+end
+
+-- 解除本插件占用的 F11/F12（关闭「按键映射」时调用）。
+-- 只有当前绑定确实指向自己的按钮时才处理，玩家的自定义绑定不受影响。
+local function ClearBindings()
+	local changed = UnbindKey(START_KEY, BTN_START)
+	if UnbindKey(STOP_KEY, BTN_STOP) then
+		changed = true
+	end
+	if changed then
+		SaveBindings(GetCurrentBindingSet())
+	end
+end
+
+-- 统一开关「按键映射」：开启则绑定并落盘，关闭则解绑并落盘，同时写入存档。
+local function SetKeyMapping(enabled)
+	keyMappingEnabled = enabled
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB.keyMappingEnabled = enabled
+	end
+	if enabled then
+		ApplyBindings()
+	else
+		ClearBindings()
+	end
+end
+
+------------------------------------------------------------------
+-- 标记骷髅：按键绑定
+------------------------------------------------------------------
+-- 只有「开关开启 + 已设置按键」时才真正绑定；任一条件不满足就解绑，
+-- 保证关闭状态下不占用玩家的按键。
+
+local function ApplySkullBinding()
+	if not skullEnabled or not skullKey or skullKey == "" then
+		return false
+	end
+	SetBindingClick(skullKey, BTN_SKULL)
+	SaveBindings(GetCurrentBindingSet())
+	-- 返回是否真的绑上了：个别客户端不认某些键（例如反斜杠），此时绑定会静默失败。
+	return IsOurBinding(skullKey, BTN_SKULL)
+end
+
+-- 解除标记骷髅的按键绑定（仅当该键确实指向本插件的骷髅按钮）。
+local function ClearSkullBinding()
+	if not skullKey or skullKey == "" then
+		return
+	end
+	if UnbindKey(skullKey, BTN_SKULL) then
+		SaveBindings(GetCurrentBindingSet())
+	end
+end
+
+-- 设置标记骷髅的按键（由设置面板的按键录制按钮调用）。
+local function SetSkullKey(key)
+	-- 与鼠标视角的两个键冲突时直接拒绝，避免把视角绑定覆盖掉。
+	if key == START_KEY or key == STOP_KEY then
+		Print("该按键已用于鼠标视角映射（" .. START_KEY .. " / " .. STOP_KEY .. "），请换一个")
+		return
+	end
+	-- 先解绑旧键，再绑新键，避免换键后旧键仍然生效。
+	if skullKey and skullKey ~= "" and skullKey ~= key then
+		ClearSkullBinding()
+	end
+	skullKey = key
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB.skullKey = key
+	end
+	if not skullEnabled then
+		Print("标记骷髅按键已设为 " .. key .. "（开关当前为关闭，开启后生效）")
+	elseif ApplySkullBinding() then
+		Print("标记骷髅按键已设为 " .. key)
+	else
+		Print("按键 " .. key .. " 未能生效（客户端可能不识别该键），请换一个")
+	end
+end
+
+-- 统一开关「标记骷髅」：开启则绑定（需先设好按键），关闭则解绑，同时写入存档。
+local function SetSkullEnabled(enabled)
+	skullEnabled = enabled
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB.skullEnabled = enabled
+	end
+	if enabled then
+		if not skullKey or skullKey == "" then
+			Print("请先在设置面板点击「设置按键」，按下一个键后再开启")
+		elseif not ApplySkullBinding() then
+			Print("按键 " .. skullKey .. " 未能生效（客户端可能不识别该键），请在设置面板重新设置")
+		end
+	else
+		ClearSkullBinding()
+	end
+end
+
 ------------------------------------------------------------------
 -- 状态查询（诊断用）
 ------------------------------------------------------------------
@@ -327,12 +498,16 @@ local function BindingState(key)
 	return action
 end
 
--- 输出当前状态：两个按键的绑定情况 + 当前是否在鼠标视角 + 调试开关。
+-- 输出当前状态：按键映射开关 + 两个按键的绑定情况 + 当前是否在鼠标视角 + 调试开关。
 local function Status()
+	Print("按键映射: " .. (keyMappingEnabled and "开启" or "关闭"))
 	Print(START_KEY .. " 绑定: " .. BindingState(START_KEY))
 	Print(STOP_KEY .. " 绑定: " .. BindingState(STOP_KEY))
 	Print("当前鼠标视角: " .. (IsMouselooking() and "开启" or "关闭"))
 	Print("移动自动锁视角: " .. (wasdAutoLock and "开启" or "关闭"))
+	Print("标记骷髅: " .. (skullEnabled and "开启" or "关闭")
+		.. "（按键: " .. (skullKey and skullKey ~= "" and skullKey or "未设置")
+		.. "，编号: " .. SKULL_ICON_NAMES[skullIcon] .. "）")
 	Print("调试日志: " .. (debugEnabled and "开启" or "关闭"))
 	Print("输入 /msa help 查看全部命令")
 end
@@ -370,8 +545,136 @@ local function SetOptionTooltip(btn, text)
 	end)
 end
 
+-- 前置声明：面板底部的绑定状态文本由后面的 refreshBindText() 负责刷新，
+-- 这里先声明，便于上方勾选框的点击回调直接调用。
+local refreshBindText
+
+local cbMapping = CreateFrame("CheckButton", "MSA_CB_Mapping", optionsPanel, "InterfaceOptionsCheckButtonTemplate")
+cbMapping:SetPoint("TOPLEFT", optionsDesc, "BOTTOMLEFT", 0, -16)
+_G["MSA_CB_MappingText"]:SetText("按键映射（F11 开 / F12 关）")
+SetOptionTooltip(cbMapping, "开启后把 F11 绑定为开启鼠标视角、F12 绑定为关闭；关闭时不占用这两个键（已绑定的会自动解除）。/msa start 与 /msa stop 命令始终可用。")
+cbMapping:SetScript("OnClick", function(self)
+	SetKeyMapping(self:GetChecked() and true or false)
+	Print("按键映射已" .. (keyMappingEnabled and "开启" or "关闭"))
+	refreshBindText()
+end)
+
+-- 标记骷髅：开关 + 按键录制。
+-- 3.3.5a 没有提供「运行时往按键设置里加条目」的接口，所以按键由自己录：
+-- 点击按钮后用 EnableKeyboard 临时接管键盘，捕获玩家按下的第一个键。
+local capturingKey = false
+
+local keyButton = CreateFrame("Button", "MSA_Btn_SetSkullKey", optionsPanel, "UIPanelButtonTemplate")
+keyButton:SetSize(200, 22)
+
+local function RefreshKeyText()
+	if capturingKey then
+		keyButton:SetText("请按下一个键（Esc 取消）")
+	else
+		keyButton:SetText("设置按键：" .. (skullKey and skullKey ~= "" and skullKey or "未设置"))
+	end
+end
+RefreshKeyText()
+
+local captureFrame = CreateFrame("Frame", "MSA_KeyCapture", UIParent)
+captureFrame:SetSize(1, 1)
+
+local function StopKeyCapture(cancelled)
+	if not capturingKey then
+		return
+	end
+	capturingKey = false
+	captureFrame:EnableKeyboard(false)
+	captureFrame:Hide()
+	RefreshKeyText()
+	if cancelled then
+		Print("已取消按键设置")
+	end
+end
+
+local function StartKeyCapture()
+	if capturingKey then
+		return
+	end
+	capturingKey = true
+	captureFrame:EnableKeyboard(true)
+	captureFrame:Show()
+	RefreshKeyText()
+	Print("请按下一个要绑定的按键（Esc 或再次点击按钮取消）")
+end
+
+captureFrame:SetScript("OnKeyDown", function(_, key)
+	if not capturingKey then
+		return
+	end
+	if key == "ESCAPE" then
+		StopKeyCapture(true)
+		return
+	end
+	-- 单独按修饰键不算一个完整按键，继续等待主键。
+	if key == "LSHIFT" or key == "RSHIFT" or key == "LCTRL"
+		or key == "RCTRL" or key == "LALT" or key == "RALT" then
+		return
+	end
+	-- OnKeyDown 只给主键，修饰键状态另外查询，拼成 "SHIFT-F10" 这样的绑定键名。
+	local combo = key
+	if IsShiftKeyDown() then combo = "SHIFT-" .. combo end
+	if IsControlKeyDown() then combo = "CTRL-" .. combo end
+	if IsAltKeyDown() then combo = "ALT-" .. combo end
+	StopKeyCapture(false)
+	SetSkullKey(combo)
+end)
+
+keyButton:SetScript("OnClick", function()
+	if capturingKey then
+		StopKeyCapture(true)
+	else
+		StartKeyCapture()
+	end
+end)
+
+local cbSkull = CreateFrame("CheckButton", "MSA_CB_Skull", optionsPanel, "InterfaceOptionsCheckButtonTemplate")
+cbSkull:SetPoint("TOPLEFT", cbMapping, "BOTTOMLEFT", 0, -4)
+_G["MSA_CB_SkullText"]:SetText("标记骷髅")
+SetOptionTooltip(cbSkull, "开启后，按下面设置的按键把当前目标标记为骷髅；关闭时不占用该按键。需在小队/团队中才能生效。")
+cbSkull:SetScript("OnClick", function(self)
+	SetSkullEnabled(self:GetChecked() and true or false)
+	Print("标记骷髅已" .. (skullEnabled and "开启" or "关闭"))
+	RefreshKeyText()
+end)
+
+-- 按键按钮缩进到勾选框文字下方，与暴雪设置面板的层次一致。
+keyButton:SetPoint("TOPLEFT", cbSkull, "BOTTOMLEFT", 26, -4)
+
+-- 标记编号下拉框：1~8 号，每项都带形状说明，默认 8 号（骷髅）。
+local iconLabel = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+iconLabel:SetText("标记编号")
+iconLabel:SetPoint("TOPLEFT", keyButton, "BOTTOMLEFT", 0, -8)
+
+local iconDropdown = CreateFrame("Frame", "MSA_SkullIconDropdown", optionsPanel, "UIDropDownMenuTemplate")
+iconDropdown:SetPoint("TOPLEFT", iconLabel, "BOTTOMLEFT", -16, 0)
+UIDropDownMenu_SetWidth(iconDropdown, 180)
+UIDropDownMenu_SetText(iconDropdown, SKULL_ICON_NAMES[skullIcon])
+UIDropDownMenu_Initialize(iconDropdown, function(_, level)
+	for i = 1, #SKULL_ICON_NAMES do
+		local info = UIDropDownMenu_CreateInfo()
+		info.text = SKULL_ICON_NAMES[i]
+		info.checked = (skullIcon == i)
+		info.func = function()
+			skullIcon = i
+			if MySteamlikeAssistantDB then
+				MySteamlikeAssistantDB.skullIcon = i
+			end
+			UIDropDownMenu_SetText(iconDropdown, SKULL_ICON_NAMES[i])
+			Print("标记编号已设为 " .. SKULL_ICON_NAMES[i])
+			CloseDropDownMenus()
+		end
+		UIDropDownMenu_AddButton(info, level)
+	end
+end)
+
 local cbWASD = CreateFrame("CheckButton", "MSA_CB_WASD", optionsPanel, "InterfaceOptionsCheckButtonTemplate")
-cbWASD:SetPoint("TOPLEFT", optionsDesc, "BOTTOMLEFT", 0, -16)
+cbWASD:SetPoint("TOPLEFT", iconDropdown, "BOTTOMLEFT", -10, -4)
 _G["MSA_CB_WASDText"]:SetText("移动自动锁视角")
 SetOptionTooltip(cbWASD, "开启后，按 W/A/S/D 开始移动时若未锁定视角则自动锁定；按 F12 或鼠标右键会重置，下次移动可再次锁定。")
 cbWASD:SetScript("OnClick", function(self)
@@ -398,10 +701,12 @@ bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -20)
 bindText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 bindText:SetJustifyH("LEFT")
 
--- 面板显示时同步控件状态与绑定信息（可能在别处用 /msa 命令改过）。
-optionsPanel:SetScript("OnShow", function()
-	cbWASD:SetChecked(wasdAutoLock)
-	cbDebug:SetChecked(debugEnabled)
+-- 刷新底部只读状态行：映射关闭时提示未占用按键，开启时显示两个键是否生效。
+refreshBindText = function()
+	if not keyMappingEnabled then
+		bindText:SetText("按键映射已关闭：不占用 " .. START_KEY .. " / " .. STOP_KEY .. "，可勾选上方开关启用。")
+		return
+	end
 	local s1 = BindingState(START_KEY)
 	local s2 = BindingState(STOP_KEY)
 	if s1 ~= "未生效" then
@@ -411,6 +716,22 @@ optionsPanel:SetScript("OnShow", function()
 		s2 = "已生效"
 	end
 	bindText:SetText(START_KEY .. " 绑定: " .. s1 .. "    " .. STOP_KEY .. " 绑定: " .. s2)
+end
+
+-- 面板显示时同步控件状态与绑定信息（可能在别处用 /msa 命令改过）。
+optionsPanel:SetScript("OnShow", function()
+	cbMapping:SetChecked(keyMappingEnabled)
+	cbSkull:SetChecked(skullEnabled)
+	cbWASD:SetChecked(wasdAutoLock)
+	cbDebug:SetChecked(debugEnabled)
+	RefreshKeyText()
+	UIDropDownMenu_SetText(iconDropdown, SKULL_ICON_NAMES[skullIcon])
+	refreshBindText()
+end)
+
+-- 面板被关闭时若还在等按键，及时释放键盘，避免键盘一直被插件占用。
+optionsPanel:SetScript("OnHide", function()
+	StopKeyCapture(false)
 end)
 
 InterfaceOptions_AddCategory(optionsPanel)
@@ -421,7 +742,9 @@ local function ShowHelp()
 	Print("  /msa            查看当前状态")
 	Print("  /msa start      手动开启鼠标视角（用于验证 API 是否可用）")
 	Print("  /msa stop       手动关闭鼠标视角")
-	Print("  /msa rebind     重新挂载并持久化绑定")
+	Print("  /msa bind       开/关「按键映射」（F11/F12 → 鼠标视角，默认关闭）")
+	Print("  /msa rebind     重新挂载并持久化绑定（同时会开启按键映射）")
+	Print("  /msa skull      开/关「标记骷髅」（默认关闭，按键在设置面板里录制）")
 	Print("  /msa wasd       开/关「移动自动锁视角」（默认关闭）")
 	Print("  /msa debug      开/关调试日志")
 	Print("  /msa diag       开/关临时诊断（打印客户端内部的鼠标状态，排查输入问题用）")
@@ -436,7 +759,9 @@ end
 --   /msa           查看状态
 --   /msa start     手动开启鼠标视角（用于验证 API 是否可用）
 --   /msa stop      手动关闭鼠标视角
---   /msa rebind    重新挂载并持久化绑定
+--   /msa bind      开/关「按键映射」（F11/F12 是否绑定到鼠标视角）
+--   /msa rebind    重新挂载并持久化绑定（同时开启按键映射）
+--   /msa skull     开/关「标记骷髅」（当前目标标记为骷髅）
 --   /msa wasd      开/关「移动自动锁视角」（W/A/S/D 移动时自动开视角）
 --   /msa debug     开/关调试日志（收到开始/停止键时在聊天框打印）
 --   /msa help      显示命令帮助
@@ -452,8 +777,14 @@ SlashCmdList["MYSTEAMLIKEASSISTANT"] = function(msg)
 	elseif msg == "stop" then
 		StopMouselook()
 	elseif msg == "rebind" then
-		ApplyBindings()
+		SetKeyMapping(true)
 		Status()
+	elseif msg == "bind" then
+		SetKeyMapping(not keyMappingEnabled)
+		Print("按键映射已" .. (keyMappingEnabled and "开启" or "关闭"))
+	elseif msg == "skull" then
+		SetSkullEnabled(not skullEnabled)
+		Print("标记骷髅已" .. (skullEnabled and "开启" or "关闭"))
 	elseif msg == "wasd" then
 		wasdAutoLock = not wasdAutoLock
 		if MySteamlikeAssistantDB then MySteamlikeAssistantDB.wasdAutoLock = wasdAutoLock end
@@ -483,16 +814,35 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 			d = {}
 			MySteamlikeAssistantDB = d
 		end
+		if d.keyMappingEnabled == nil then d.keyMappingEnabled = false end
 		if d.wasdAutoLock == nil then d.wasdAutoLock = false end
 		if d.debugEnabled == nil then d.debugEnabled = false end
+		if d.skullEnabled == nil then d.skullEnabled = false end
+		if d.skullKey == nil or d.skullKey == "" then d.skullKey = SKULL_DEFAULT_KEY end
+		if d.skullIcon == nil or not SKULL_ICON_NAMES[d.skullIcon] then d.skullIcon = SKULL_ICON_DEFAULT end
+		keyMappingEnabled = d.keyMappingEnabled
 		wasdAutoLock = d.wasdAutoLock
 		debugEnabled = d.debugEnabled
+		skullEnabled = d.skullEnabled
+		skullKey = d.skullKey
+		skullIcon = d.skullIcon
 		self:UnregisterEvent("ADDON_LOADED")
 	elseif event == "PLAYER_LOGIN" then
 		-- 此刻按键表已加载完成，挂载绑定时机最稳；随后做一次自检。
-		ApplyBindings()
-		if BindingState(START_KEY) == "未生效" then
-			Print(START_KEY .. " 未生效，客户端可能不识别该按键。")
+		if keyMappingEnabled then
+			ApplyBindings()
+			if BindingState(START_KEY) == "未生效" then
+				Print(START_KEY .. " 未生效，客户端可能不识别该按键。")
+			end
+		else
+			-- 映射关闭时不占用按键：顺便清掉旧版本可能遗留的绑定。
+			ClearBindings()
+		end
+		-- 标记骷髅同理：只有开关开启且设置过按键时才绑定，否则确保解绑。
+		if skullEnabled then
+			ApplySkullBinding()
+		else
+			ClearSkullBinding()
 		end
 		self:UnregisterEvent("PLAYER_LOGIN")
 	end
