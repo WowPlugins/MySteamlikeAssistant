@@ -697,7 +697,7 @@ end)
 -- 只显示“已生效/未生效”，不显示底层动作串（如 CLICK ...:LeftButton），
 -- 避免文字过长顶出面板边框；同时加右锚点，万一超长也能在面板内换行。
 local bindText = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -20)
+bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -14)
 bindText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 bindText:SetJustifyH("LEFT")
 
@@ -717,6 +717,27 @@ refreshBindText = function()
 	end
 	bindText:SetText(START_KEY .. " 绑定: " .. s1 .. "    " .. STOP_KEY .. " 绑定: " .. s2)
 end
+
+-- 只读的命令速查，省得玩家再打 /msa help；内容与 ShowHelp() 保持一致。
+local cmdTitle = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
+cmdTitle:SetPoint("TOPLEFT", bindText, "BOTTOMLEFT", 0, -12)
+cmdTitle:SetText("斜杠命令（/msa 或 /bridge 均可）")
+
+local cmdText = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+cmdText:SetPoint("TOPLEFT", cmdTitle, "BOTTOMLEFT", 0, -2)
+cmdText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
+cmdText:SetJustifyH("LEFT")
+cmdText:SetText(
+	"/msa - 查看当前状态\n"
+	.. "/msa bind - 开/关「按键映射」（" .. START_KEY .. " 开 / " .. STOP_KEY .. " 关）\n"
+	.. "/msa skull - 开/关「标记骷髅」（默认关闭，编号与按键见上方）\n"
+	.. "/msa wasd - 开/关「移动自动锁视角」\n"
+	.. "/msa start / stop - 手动开启 / 关闭鼠标视角\n"
+	.. "/msa debug - 开/关调试日志\n"
+	.. "/msa diag - 开/关临时诊断（排查输入问题用）\n"
+	.. "/msa rebind - 重新挂载并持久化绑定\n"
+	.. "/msa help - 显示本帮助"
+)
 
 -- 面板显示时同步控件状态与绑定信息（可能在别处用 /msa 命令改过）。
 optionsPanel:SetScript("OnShow", function()
