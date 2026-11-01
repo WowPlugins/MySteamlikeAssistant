@@ -74,6 +74,12 @@ local SKULL_ICON_NAMES = {
 	"8 - 骷髅（白色骷髅头）",
 }
 
+-- 「登录时自动应用聊天窗口布局」开关：开启后，每次登录 / 重载界面时
+-- 自动把存档里的聊天窗口布局（位置、尺寸、锁定、字号）写回聊天框。
+-- 手机端与电脑端分辨率不同，聊天窗口会跑到不合适的位置，用它就不用每次手动拖。
+-- **默认关闭**，可在设置面板勾选，或用 /msa chat auto 切换。
+local chatAutoApply = false
+
 -- WASD 本次“已锁定”标记：一旦通过方向键锁上视角，就把后续按键直接短路，
 -- 不再每次按键都调用 IsMouselooking() 判断，避免无谓的重复检查。
 -- 以下情况会重置该标记，以便下次移动能重新判断并锁定：
@@ -513,6 +519,220 @@ local function Status()
 end
 
 ------------------------------------------------------------------
+-- 聊天窗口布局存档（位置 / 尺寸 / 锁定 / 字号）
+------------------------------------------------------------------
+-- 用途：手机端（模拟器）与电脑端的屏幕分辨率差别很大，客户端自带的
+-- Chat-cache 只记住“最后一次”的聊天窗口状态，换分辨率后窗口经常跑到屏幕外
+-- 或者被挡住，只能手动拖回来、重新解/锁、重新调字号。
+--
+-- 这里额外存一份“常用布局快照”：把当前所有聊天窗口（包括停靠在一起的标签页组合）
+-- 的位置、宽高、锁定状态、字号写进插件存档；
+-- 切换设备后点一下「应用布局」，或勾选「登录时自动应用」，就整体恢复。
+--
+-- 注意：停靠在其它聊天窗口上的子窗口，位置由主窗口控制，
+-- 所以只恢复它们的字号与锁定，不动位置和尺寸。
+local CHAT_WINDOW_FALLBACK_MAX = 10
+
+-- 取第 index 个聊天窗口（ChatFrame1 ~ ChatFrame10）。
+local function GetChatFrame(index)
+	local name = "ChatFrame" .. index
+	return _G[name]
+end
+
+-- 判断某个窗口是否是停靠在其它聊天窗口上的子窗口（锚点指向 ChatFrameX）。
+local function IsDockedChatChild(frame)
+	local _, relativeTo = frame:GetPoint(1)
+	if not relativeTo or type(relativeTo.GetName) ~= "function" then
+		return false
+	end
+	local relativeName = relativeTo:GetName()
+	if type(relativeName) ~= "string" then
+		return false
+	end
+	return string.find(relativeName, "ChatFrame", 1, true) ~= nil
+end
+
+-- 把窗口当前的位置 / 尺寸写进客户端的聊天缓存（WTF 下的 chat-cache.txt）。
+-- 客户端只在自己拖动聊天窗口时才记录位置；插件用 SetPoint 摆好之后必须显式调一次，
+-- 否则完全退出再登录，客户端仍按旧缓存把窗口摆回原来的地方。
+local function PersistChatFramePosition(frame)
+	if type(FCF_SavePositionAndDimensions) ~= "function" then
+		return false
+	end
+	return (pcall(FCF_SavePositionAndDimensions, frame))
+end
+
+-- 收集当前聊天窗口布局。返回 nil 表示客户端不支持读取聊天窗口信息。
+local function CaptureChatLayout()
+	if type(FCF_GetChatWindowInfo) ~= "function" then
+		return nil
+	end
+	local maxWindows = NUM_CHAT_WINDOWS or CHAT_WINDOW_FALLBACK_MAX
+	local windows = {}
+	local count = 0
+	local lockedCount = 0
+	for i = 1, maxWindows do
+		local f = GetChatFrame(i)
+		if f then
+			-- 3.3.5：name, fontSize, r, g, b, alpha, shown, locked, docked, uninteractable
+			local name, fontSize, _, _, _, _, shown, locked = FCF_GetChatWindowInfo(i)
+			local info = {}
+			info.name = type(name) == "string" and name or (f:GetName() or tostring(i))
+			info.fontSize = type(fontSize) == "number" and fontSize or nil
+			-- 锁定状态：优先用 API 的返回值（布尔或 0/1 数字），取不到时读聊天框自身的 isLocked 字段。
+			if type(locked) == "boolean" then
+				info.locked = locked
+			elseif type(locked) == "number" then
+				info.locked = (locked ~= 0)
+			elseif type(f.isLocked) == "boolean" then
+				info.locked = f.isLocked
+			elseif type(f.isLocked) == "number" then
+				info.locked = (f.isLocked ~= 0)
+			end
+			if info.locked then
+				lockedCount = lockedCount + 1
+			end
+			info.shown = type(shown) == "boolean" and shown or f:IsShown()
+			-- 只有显示中的窗口才有有效的位置与尺寸，隐藏的窗口取不到几何信息。
+			if f:IsShown() then
+				local left, top = f:GetLeft(), f:GetTop()
+				local width, height = f:GetWidth(), f:GetHeight()
+				if left and top and width and height then
+					info.left = math.floor(left)
+					info.top = math.floor(top)
+					info.width = math.floor(width)
+					info.height = math.floor(height)
+				end
+			end
+			windows[i] = info
+			count = count + 1
+		end
+	end
+	if count == 0 then
+		return nil
+	end
+	return {
+		windows = windows,
+		count = count,
+		lockedCount = lockedCount,
+		savedAt = date("%m-%d %H:%M"),
+	}
+end
+
+-- 把存档里的布局写回聊天窗口。silent 为 true 时不打印结果（用于登录自动应用）。
+local function ApplyChatLayout(silent)
+	local layout = MySteamlikeAssistantDB and MySteamlikeAssistantDB.chatLayout
+	if not layout or type(layout.windows) ~= "table" then
+		if not silent then
+			Print("还没有保存过聊天窗口布局，请先点「保存布局」")
+		end
+		return false
+	end
+
+	local applied = 0
+	local persisted = 0
+	for i, info in pairs(layout.windows) do
+		local f = GetChatFrame(tonumber(i))
+		if f and type(info) == "table" then
+			-- 1) 先解锁：锁定状态下部分客户端不允许改动窗口位置 / 尺寸。
+			if type(FCF_SetLocked) == "function" then
+				pcall(FCF_SetLocked, f, false)
+			end
+			f.isLocked = false
+
+			-- 2) 字号：每个窗口单独生效（停靠在一起的窗口也可以各用各的字号）。
+			if info.fontSize and info.fontSize > 0 then
+				pcall(FCF_SetChatWindowFontSize, f, info.fontSize)
+			end
+
+			-- 3) 位置与尺寸：只处理"不依附于其它聊天窗口"的窗口（即停靠组合的主窗口）。
+			if not IsDockedChatChild(f) and info.left and info.top then
+				local parentWidth = UIParent:GetWidth() or 0
+				local parentHeight = UIParent:GetHeight() or 0
+				-- 尺寸不超过当前屏幕，换到更小的分辨率时窗口也不会被裁掉。
+				local width = math.min(math.max(50, info.width or (f:GetWidth() or 0)), math.max(50, parentWidth))
+				local height = math.min(math.max(20, info.height or (f:GetHeight() or 0)), math.max(20, parentHeight))
+				f:SetWidth(width)
+				f:SetHeight(height)
+
+				-- 分辨率换小以后，存档坐标可能跑到屏幕外，这里夹回可见区域。
+				local left = math.min(math.max(0, info.left), math.max(0, parentWidth - width))
+				local top = math.min(math.max(height, info.top), math.max(height, parentHeight))
+				f:ClearAllPoints()
+				f:SetPoint("BOTTOMLEFT", UIParent, "BOTTOMLEFT", math.floor(left), math.floor(top - height))
+
+				-- 位置摆好后写进客户端聊天缓存：不写的话，完全退出再登录时
+				-- 客户端会按旧缓存把窗口摆回原处，等于这次应用白做。
+				if PersistChatFramePosition(f) then
+					persisted = persisted + 1
+				end
+			end
+
+			-- 4) 位置摆好后再恢复存档里的锁定状态。
+			if info.locked ~= nil then
+				if type(FCF_SetLocked) == "function" then
+					pcall(FCF_SetLocked, f, info.locked)
+				end
+				-- 少数客户端只认聊天框自身的字段，这里再补齐一次，确保真的锁上 / 解锁。
+				f.isLocked = info.locked
+			end
+
+			applied = applied + 1
+		end
+	end
+
+	if applied == 0 then
+		if not silent then
+			Print("没有找到可恢复的聊天窗口")
+		end
+		return false
+	end
+	if not silent then
+		Print("已应用聊天窗口布局（" .. applied .. " 个窗口）")
+		if type(FCF_SavePositionAndDimensions) ~= "function" then
+			Print("当前客户端不支持写入聊天缓存，位置可能无法在退出后保持；建议在设置里勾选「登录时自动应用」")
+		elseif persisted > 0 then
+			Debug("已写入客户端聊天缓存（" .. persisted .. " 个窗口），退出后位置会保持")
+		end
+	end
+	return true
+end
+
+-- 保存当前聊天窗口布局到插件存档。
+local function SaveChatLayout()
+	local layout = CaptureChatLayout()
+	if not layout then
+		Print("无法读取聊天窗口信息，当前客户端可能不支持（需要 FCF_GetChatWindowInfo）")
+		return false
+	end
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB.chatLayout = layout
+	end
+	Print("聊天窗口布局已保存（" .. layout.count .. " 个窗口，" .. (layout.lockedCount or 0) .. " 个锁定，" .. layout.savedAt .. "）")
+	return true
+end
+
+-- 开/关「登录时自动应用聊天窗口布局」。
+local function SetChatAutoApply(enabled)
+	chatAutoApply = enabled
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB.chatAutoApply = enabled
+	end
+end
+
+-- 输出聊天窗口布局的存档状态（/msa chat）。
+local function PrintChatLayoutStatus()
+	local layout = MySteamlikeAssistantDB and MySteamlikeAssistantDB.chatLayout
+	if layout and type(layout.windows) == "table" then
+		Print("聊天窗口布局: 已保存（" .. (layout.savedAt or "?") .. "，" .. (layout.count or 0) .. " 个窗口，"
+			.. (layout.lockedCount or 0) .. " 个锁定）")
+	else
+		Print("聊天窗口布局: 尚未保存（用 /msa chat save 保存当前布局）")
+	end
+	Print("登录时自动应用: " .. (chatAutoApply and "开启" or "关闭"))
+end
+
+------------------------------------------------------------------
 -- 设置面板（Esc → 界面 → MySteamlikeAssistant）
 ------------------------------------------------------------------
 -- 3.3.5a 没有独立的“插件”标签页，插件设置是用 InterfaceOptions_AddCategory
@@ -530,7 +750,7 @@ local optionsDesc = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighl
 optionsDesc:SetPoint("TOPLEFT", optionsTitle, "BOTTOMLEFT", 0, -8)
 optionsDesc:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 optionsDesc:SetJustifyH("LEFT")
-optionsDesc:SetText("接收 F11 / F12 控制鼠标视角。以下设置会自动保存，重载界面后仍然保留。")
+optionsDesc:SetText("接收 F11 / F12 控制鼠标视角。以下设置自动保存，重载后保留。")
 
 -- 给勾选框挂上暴雪风格的鼠标提示。
 local function SetOptionTooltip(btn, text)
@@ -565,7 +785,7 @@ end)
 local capturingKey = false
 
 local keyButton = CreateFrame("Button", "MSA_Btn_SetSkullKey", optionsPanel, "UIPanelButtonTemplate")
-keyButton:SetSize(200, 22)
+keyButton:SetSize(160, 22)
 
 local function RefreshKeyText()
 	if capturingKey then
@@ -697,7 +917,7 @@ end)
 -- 只显示“已生效/未生效”，不显示底层动作串（如 CLICK ...:LeftButton），
 -- 避免文字过长顶出面板边框；同时加右锚点，万一超长也能在面板内换行。
 local bindText = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -14)
+bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -10)
 bindText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 bindText:SetJustifyH("LEFT")
 
@@ -720,7 +940,7 @@ end
 
 -- 只读的命令速查，省得玩家再打 /msa help；内容与 ShowHelp() 保持一致。
 local cmdTitle = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormalSmall")
-cmdTitle:SetPoint("TOPLEFT", bindText, "BOTTOMLEFT", 0, -12)
+cmdTitle:SetPoint("TOPLEFT", bindText, "BOTTOMLEFT", 0, -8)
 cmdTitle:SetText("斜杠命令（/msa 或 /bridge 均可）")
 
 local cmdText = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
@@ -728,16 +948,94 @@ cmdText:SetPoint("TOPLEFT", cmdTitle, "BOTTOMLEFT", 0, -2)
 cmdText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 cmdText:SetJustifyH("LEFT")
 cmdText:SetText(
-	"/msa - 查看当前状态\n"
+	"/msa - 查看状态            /msa help - 显示本帮助\n"
 	.. "/msa bind - 开/关「按键映射」（" .. START_KEY .. " 开 / " .. STOP_KEY .. " 关）\n"
-	.. "/msa skull - 开/关「标记骷髅」（默认关闭，编号与按键见上方）\n"
-	.. "/msa wasd - 开/关「移动自动锁视角」\n"
+	.. "/msa skull - 标记骷髅开关  /msa wasd - 移动自动锁视角\n"
 	.. "/msa start / stop - 手动开启 / 关闭鼠标视角\n"
-	.. "/msa debug - 开/关调试日志\n"
-	.. "/msa diag - 开/关临时诊断（排查输入问题用）\n"
+	.. "/msa debug / diag - 调试日志 / 临时诊断\n"
 	.. "/msa rebind - 重新挂载并持久化绑定\n"
-	.. "/msa help - 显示本帮助"
+	.. "/msa chat - 聊天布局存档：save 保存 / load 应用 / auto 自动"
 )
+
+------------------------------------------------------------------
+-- 设置面板右侧：聊天窗口布局
+------------------------------------------------------------------
+-- 放在面板右列，避免左侧已有的选项被往下挤、超出面板高度。
+-- 控件沿用暴雪原生模板（UIPanelButtonTemplate / InterfaceOptionsCheckButtonTemplate）。
+-- 前置声明：右列布局存档的只读说明由后面的 refreshChatLayoutText() 刷新，
+-- 先声明便于上方按钮的点击回调直接调用。
+local refreshChatLayoutText
+
+local chatPanelTitle = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+chatPanelTitle:SetText("聊天窗口布局")
+
+local chatSaveButton = CreateFrame("Button", "MSA_Btn_ChatSave", optionsPanel, "UIPanelButtonTemplate")
+chatSaveButton:SetSize(80, 22)
+chatSaveButton:SetText("保存布局")
+SetOptionTooltip(chatSaveButton, "把当前聊天窗口（含停靠的标签页组合）的位置、尺寸、锁定状态与字号存入插件存档。")
+chatSaveButton:SetScript("OnClick", function()
+	SaveChatLayout()
+	refreshChatLayoutText()
+end)
+
+local chatLoadButton = CreateFrame("Button", "MSA_Btn_ChatLoad", optionsPanel, "UIPanelButtonTemplate")
+chatLoadButton:SetSize(80, 22)
+chatLoadButton:SetText("应用布局")
+SetOptionTooltip(chatLoadButton, "把已保存的聊天窗口布局写回聊天框；分辨率变小后会自动夹回屏幕可见区域。")
+chatLoadButton:SetScript("OnClick", function()
+	ApplyChatLayout()
+	refreshChatLayoutText()
+end)
+
+local cbChatAuto = CreateFrame("CheckButton", "MSA_CB_ChatAuto", optionsPanel, "InterfaceOptionsCheckButtonTemplate")
+_G["MSA_CB_ChatAutoText"]:SetText("登录时自动应用")
+SetOptionTooltip(cbChatAuto, "开启后，每次登录 / 重载界面都会自动套用已保存的聊天窗口布局，切换手机与电脑时不用手动恢复。")
+cbChatAuto:SetScript("OnClick", function(self)
+	SetChatAutoApply(self:GetChecked() and true or false)
+	Print("登录时自动应用聊天布局已" .. (chatAutoApply and "开启" or "关闭"))
+end)
+
+local chatStatus = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+chatStatus:SetJustifyH("LEFT")
+
+-- 右列排版：标题与左列第一个开关对齐，整列右边缘贴住面板右边。
+-- 面板每次显示时才拿得到真实宽度与行位置，所以在 OnShow 里调用。
+local function ReflowChatColumn()
+	local panelTop, rowTop = optionsPanel:GetTop(), cbMapping:GetTop()
+	local topOffset = -48
+	if panelTop and rowTop then
+		topOffset = rowTop - panelTop
+	end
+
+	chatPanelTitle:ClearAllPoints()
+	chatPanelTitle:SetPoint("TOPRIGHT", optionsPanel, "TOPRIGHT", -16, topOffset)
+
+	chatLoadButton:ClearAllPoints()
+	chatLoadButton:SetPoint("TOPRIGHT", chatPanelTitle, "BOTTOMRIGHT", 0, -6)
+
+	chatSaveButton:ClearAllPoints()
+	chatSaveButton:SetPoint("TOPRIGHT", chatLoadButton, "TOPLEFT", -4, 0)
+
+	cbChatAuto:ClearAllPoints()
+	cbChatAuto:SetPoint("TOPLEFT", chatSaveButton, "BOTTOMLEFT", 0, -6)
+
+	chatStatus:ClearAllPoints()
+	chatStatus:SetPoint("TOPLEFT", chatSaveButton, "BOTTOMLEFT", 0, -44)
+	chatStatus:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
+end
+
+-- 刷新右列只读说明：显示上次保存时间、窗口数量与锁定数量。
+refreshChatLayoutText = function()
+	local layout = MySteamlikeAssistantDB and MySteamlikeAssistantDB.chatLayout
+	if layout and type(layout.windows) == "table" then
+		chatStatus:SetText("已保存 " .. (layout.savedAt or "?") .. "\n"
+			.. (layout.count or 0) .. " 个窗口，" .. (layout.lockedCount or 0) .. " 个锁定")
+	else
+		chatStatus:SetText("尚未保存布局，点「保存布局」记录当前状态")
+	end
+end
+refreshChatLayoutText()
+ReflowChatColumn()
 
 -- 面板显示时同步控件状态与绑定信息（可能在别处用 /msa 命令改过）。
 optionsPanel:SetScript("OnShow", function()
@@ -745,9 +1043,18 @@ optionsPanel:SetScript("OnShow", function()
 	cbSkull:SetChecked(skullEnabled)
 	cbWASD:SetChecked(wasdAutoLock)
 	cbDebug:SetChecked(debugEnabled)
+	cbChatAuto:SetChecked(chatAutoApply)
 	RefreshKeyText()
 	UIDropDownMenu_SetText(iconDropdown, SKULL_ICON_NAMES[skullIcon])
 	refreshBindText()
+	refreshChatLayoutText()
+	ReflowChatColumn()
+	-- 刚显示时面板宽度与文字换行可能还没最终确定，下一帧再排一次，
+	-- 保证右列不会压到描述文字、也不会跑到边框外。
+	optionsPanel:SetScript("OnUpdate", function(self)
+		self:SetScript("OnUpdate", nil)
+		ReflowChatColumn()
+	end)
 end)
 
 -- 面板被关闭时若还在等按键，及时释放键盘，避免键盘一直被插件占用。
@@ -769,6 +1076,10 @@ local function ShowHelp()
 	Print("  /msa wasd       开/关「移动自动锁视角」（默认关闭）")
 	Print("  /msa debug      开/关调试日志")
 	Print("  /msa diag       开/关临时诊断（打印客户端内部的鼠标状态，排查输入问题用）")
+	Print("  /msa chat       查看聊天窗口布局存档状态")
+	Print("  /msa chat save  保存当前聊天窗口布局（位置 / 尺寸 / 锁定 / 字号）")
+	Print("  /msa chat load  应用已保存的聊天窗口布局")
+	Print("  /msa chat auto  开/关「登录时自动应用聊天窗口布局」")
 	Print("  /msa help       显示本帮助")
 	Print("  /bridge         与 /msa 完全等价的别名")
 	Print("提示：以上设置也可在 Esc → 界面 → MySteamlikeAssistant 中调整")
@@ -816,6 +1127,19 @@ SlashCmdList["MYSTEAMLIKEASSISTANT"] = function(msg)
 		Print("调试日志已" .. (debugEnabled and "开启" or "关闭"))
 	elseif msg == "diag" then
 		ToggleDiag()
+	elseif msg == "chat" then
+		PrintChatLayoutStatus()
+	elseif msg == "chat save" then
+		if SaveChatLayout() then
+			refreshChatLayoutText()
+		end
+	elseif msg == "chat load" then
+		ApplyChatLayout()
+		refreshChatLayoutText()
+	elseif msg == "chat auto" then
+		SetChatAutoApply(not chatAutoApply)
+		Print("登录时自动应用聊天布局已" .. (chatAutoApply and "开启" or "关闭"))
+		refreshChatLayoutText()
 	else
 		Status()
 	end
@@ -825,9 +1149,14 @@ end
 -- 事件：加载存档 + 登录后挂钩
 ------------------------------------------------------------------
 -- ADDON_LOADED 时把存档读入内存：首次运行或字段缺失时补默认值。
+-- 每次插件加载（登录 / 重载界面）只自动应用一次聊天布局，
+-- 用这个标记避免进出副本触发 PLAYER_ENTERING_WORLD 时反复覆盖玩家的手动调整。
+local chatLayoutAppliedThisLogin = false
+
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
+frame:RegisterEvent("PLAYER_ENTERING_WORLD")
 frame:SetScript("OnEvent", function(self, event, arg1)
 	if event == "ADDON_LOADED" and arg1 == "MySteamlikeAssistant" then
 		local d = MySteamlikeAssistantDB
@@ -841,12 +1170,14 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 		if d.skullEnabled == nil then d.skullEnabled = false end
 		if d.skullKey == nil or d.skullKey == "" then d.skullKey = SKULL_DEFAULT_KEY end
 		if d.skullIcon == nil or not SKULL_ICON_NAMES[d.skullIcon] then d.skullIcon = SKULL_ICON_DEFAULT end
+		if d.chatAutoApply == nil then d.chatAutoApply = false end
 		keyMappingEnabled = d.keyMappingEnabled
 		wasdAutoLock = d.wasdAutoLock
 		debugEnabled = d.debugEnabled
 		skullEnabled = d.skullEnabled
 		skullKey = d.skullKey
 		skullIcon = d.skullIcon
+		chatAutoApply = d.chatAutoApply
 		self:UnregisterEvent("ADDON_LOADED")
 	elseif event == "PLAYER_LOGIN" then
 		-- 此刻按键表已加载完成，挂载绑定时机最稳；随后做一次自检。
@@ -866,5 +1197,13 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 			ClearSkullBinding()
 		end
 		self:UnregisterEvent("PLAYER_LOGIN")
+	elseif event == "PLAYER_ENTERING_WORLD" then
+		-- 进入世界时聊天窗口已按客户端缓存摆放完毕，此时套用存档布局最稳。
+		if chatAutoApply and not chatLayoutAppliedThisLogin then
+			chatLayoutAppliedThisLogin = true
+			if ApplyChatLayout(true) then
+				Print("已自动应用聊天窗口布局")
+			end
+		end
 	end
 end)
