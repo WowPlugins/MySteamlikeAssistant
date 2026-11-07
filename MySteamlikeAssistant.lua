@@ -539,8 +539,32 @@ local function GetChatFrame(index)
 	return _G[name]
 end
 
--- 判断某个窗口是否是停靠在其它聊天窗口上的子窗口（锚点指向 ChatFrameX）。
-local function IsDockedChatChild(frame)
+-- 读取第 index 个聊天窗口当前停靠到哪个窗口（返回自己的编号或 0 表示独立）。
+local function ReadChatDockIndex(index)
+	if type(index) ~= "number" or type(FCF_GetChatWindowInfo) ~= "function" then
+		return nil
+	end
+	local ok, _, _, _, _, _, _, _, _, docked = pcall(FCF_GetChatWindowInfo, index)
+	if ok and type(docked) == "number" then
+		return docked
+	end
+	return nil
+end
+
+-- 判断某个窗口是否是停靠在其它聊天窗口上的子窗口。
+-- 3.3.5 的 FCF_GetChatWindowInfo 第 9 个返回值是“停靠到哪个窗口”：
+-- 独立窗口返回自己的编号（或 0），停靠子窗口返回主窗口编号，用它判断最准。
+-- 读不到时（旧存档 / API 差异）退回按锚点是否指向 ChatFrameX 判断。
+local function IsDockedChatChild(frame, info, index)
+	index = index or frame:GetID()
+	local docked = ReadChatDockIndex(index)
+	if docked == nil and type(info) == "table" then
+		docked = info.docked
+	end
+	if type(docked) == "number" and type(index) == "number" then
+		-- docked 为 0 或等于自己的编号，都说明它是独立窗口（不是别人的停靠子窗口）。
+		return docked ~= 0 and docked ~= index
+	end
 	local _, relativeTo = frame:GetPoint(1)
 	if not relativeTo or type(relativeTo.GetName) ~= "function" then
 		return false
@@ -575,10 +599,12 @@ local function CaptureChatLayout()
 		local f = GetChatFrame(i)
 		if f then
 			-- 3.3.5：name, fontSize, r, g, b, alpha, shown, locked, docked, uninteractable
-			local name, fontSize, _, _, _, _, shown, locked = FCF_GetChatWindowInfo(i)
+			local name, fontSize, _, _, _, _, shown, locked, docked = FCF_GetChatWindowInfo(i)
 			local info = {}
 			info.name = type(name) == "string" and name or (f:GetName() or tostring(i))
 			info.fontSize = type(fontSize) == "number" and fontSize or nil
+			-- 记下停靠关系：应用时用它区分主窗口与停靠子窗口，比看锚点可靠。
+			info.docked = type(docked) == "number" and docked or nil
 			-- 锁定状态：优先用 API 的返回值（布尔或 0/1 数字），取不到时读聊天框自身的 isLocked 字段。
 			if type(locked) == "boolean" then
 				info.locked = locked
@@ -641,12 +667,13 @@ local function ApplyChatLayout(silent)
 			f.isLocked = false
 
 			-- 2) 字号：每个窗口单独生效（停靠在一起的窗口也可以各用各的字号）。
+			-- 注意 3.3.5 的签名是 (chatFrame, editBox, size)，必须把聊天框同时传成 editBox。
 			if info.fontSize and info.fontSize > 0 then
-				pcall(FCF_SetChatWindowFontSize, f, info.fontSize)
+				pcall(FCF_SetChatWindowFontSize, f, f, info.fontSize)
 			end
 
 			-- 3) 位置与尺寸：只处理"不依附于其它聊天窗口"的窗口（即停靠组合的主窗口）。
-			if not IsDockedChatChild(f) and info.left and info.top then
+			if not IsDockedChatChild(f, info, tonumber(i)) and info.left and info.top then
 				local parentWidth = UIParent:GetWidth() or 0
 				local parentHeight = UIParent:GetHeight() or 0
 				-- 尺寸不超过当前屏幕，换到更小的分辨率时窗口也不会被裁掉。
@@ -1153,6 +1180,28 @@ end
 -- 用这个标记避免进出副本触发 PLAYER_ENTERING_WORLD 时反复覆盖玩家的手动调整。
 local chatLayoutAppliedThisLogin = false
 
+-- 自动应用不能紧跟着 PLAYER_ENTERING_WORLD 立刻执行：客户端在这之后还会按
+-- chat-cache.txt 把聊天窗口再摆一次，立刻应用会被它覆盖（表现就是“勾了自动应用却没变化”）。
+-- 3.3.5 没有 C_Timer，这里用一个只触发一次的 OnUpdate 计时器，等客户端摆完再套用。
+local chatApplyTimer = CreateFrame("Frame", nil, UIParent)
+local chatApplyRemaining = 0
+chatApplyTimer:Hide()
+chatApplyTimer:SetScript("OnUpdate", function(self, elapsed)
+	chatApplyRemaining = chatApplyRemaining - elapsed
+	if chatApplyRemaining > 0 then
+		return
+	end
+	self:Hide()
+	if ApplyChatLayout(true) then
+		Print("已自动应用聊天窗口布局")
+	end
+end)
+
+local function ScheduleChatAutoApply()
+	chatApplyRemaining = 1.5
+	chatApplyTimer:Show()
+end
+
 local frame = CreateFrame("Frame")
 frame:RegisterEvent("ADDON_LOADED")
 frame:RegisterEvent("PLAYER_LOGIN")
@@ -1198,12 +1247,10 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 		end
 		self:UnregisterEvent("PLAYER_LOGIN")
 	elseif event == "PLAYER_ENTERING_WORLD" then
-		-- 进入世界时聊天窗口已按客户端缓存摆放完毕，此时套用存档布局最稳。
+		-- 此时聊天窗口还会被客户端按缓存再摆一次，所以只安排延迟应用，等它摆完再套用存档布局。
 		if chatAutoApply and not chatLayoutAppliedThisLogin then
 			chatLayoutAppliedThisLogin = true
-			if ApplyChatLayout(true) then
-				Print("已自动应用聊天窗口布局")
-			end
+			ScheduleChatAutoApply()
 		end
 	end
 end)
