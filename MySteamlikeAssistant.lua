@@ -18,6 +18,10 @@
 --   当玩家用 W/A/S/D 方向键开始移动时，若当前不在鼠标视角，则自动开启，
 --   让相机跟随角色移动。实现方式见下方“移动自动锁视角”一节。
 --
+--   另外提供一个「组合键提示」功能（Ctrl / Alt / Shift 各自独立开关，默认全开）：
+--   按住修饰键时，在绑定了对应组合（+1 ~ +0）的动作条按钮上浮出「Ctrl+N」角标
+--   并描一圈亮边，松开即消失；只读展示，不改动任何按键绑定。
+--
 -- 原理：
 --   使用 SetBindingClick 把 F11/F12 绑定到两个“隐藏按钮”的点击事件上。
 --   按键触发时，客户端会调用对应按钮的 OnClick 脚本，从而执行开启/关闭逻辑。
@@ -25,7 +29,7 @@
 --   但绑定是真实生效的（用 /msa 可看到 “CLICK MSA_Btn_F20:LeftButton”）。
 --
 -- 相关 API（3.3.5a 客户端均已验证存在）：
---   IsMouselooking()  -> 返回当前是否处于鼠标视角
+--   IsMou1selooking()  -> 返回当前是否处于鼠标视角
 --   MouselookStart()  -> 开启鼠标视角
 --   MouselookStop()   -> 关闭鼠标视角
 ------------------------------------------------------------------
@@ -79,6 +83,14 @@ local SKULL_ICON_NAMES = {
 -- 手机端与电脑端分辨率不同，聊天窗口会跑到不合适的位置，用它就不用每次手动拖。
 -- **默认关闭**，可在设置面板勾选，或用 /msa chat auto 切换。
 local chatAutoApply = false
+
+-- 「组合键提示」开关：按住 Ctrl / Alt / Shift 时，在绑定了对应组合（+1 ~ +0）的
+-- 动作条按钮上浮出「Ctrl+N」角标并描边，松开即消失。只读展示，不改动任何按键绑定。
+-- 三个修饰键各有独立开关，**默认全部开启**；
+-- 可在设置面板勾选，或用 /msa ctrl、/msa alt、/msa shift 分别切换。
+local ctrlHintEnabled = true
+local altHintEnabled = true
+local shiftHintEnabled = true
 
 -- WASD 本次“已锁定”标记：一旦通过方向键锁上视角，就把后续按键直接短路，
 -- 不再每次按键都调用 IsMouselooking() 判断，避免无谓的重复检查。
@@ -515,6 +527,9 @@ local function Status()
 		.. "（按键: " .. (skullKey and skullKey ~= "" and skullKey or "未设置")
 		.. "，编号: " .. SKULL_ICON_NAMES[skullIcon] .. "）")
 	Print("调试日志: " .. (debugEnabled and "开启" or "关闭"))
+	Print("组合键提示: Ctrl " .. (ctrlHintEnabled and "开" or "关")
+		.. " / Alt " .. (altHintEnabled and "开" or "关")
+		.. " / Shift " .. (shiftHintEnabled and "开" or "关"))
 	Print("输入 /msa help 查看全部命令")
 end
 
@@ -760,6 +775,233 @@ local function PrintChatLayoutStatus()
 end
 
 ------------------------------------------------------------------
+-- 组合键提示（按住 Ctrl / Alt / Shift 时标出绑定了对应组合的动作条按钮）
+------------------------------------------------------------------
+-- 用途：有些按键是 Ctrl+1 ~ Ctrl+8、Alt+1 ~ Alt+8 这类组合键，平时动作条上
+-- 只显示 1~8，记不住某个组合对应哪一格。按住修饰键时在对应按钮上浮出
+-- 「Ctrl+N」角标并描一圈亮边，松开即消失；只读展示，不改动任何按键绑定。
+-- 同时按住多个修饰键时按真实组合查询（例如 Ctrl+Shift+1 -> "CTRL-SHIFT-1"）。
+-- 兼容原版动作条与 Bartender4（BT4 的按钮是 BT4ButtonN，绑定动作形如 CLICK ...）。
+--
+-- 参与提示的数字键（+1 ~ +9 与 +0）。
+local CTRL_HINT_KEYS = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }
+
+-- 原生动作条的绑定命令前缀 → 按钮名前缀（3.3.5 的绑定名是全大写）。
+local CTRL_HINT_BUTTON_PREFIX = {
+	ACTIONBUTTON = "ActionButton",
+	BONUSACTIONBUTTON = "BonusActionButton",
+	SHAPESHIFTBUTTON = "ShapeshiftButton",
+	PETACTIONBUTTON = "PetActionButton",
+	MULTIACTIONBAR1BUTTON = "MultiBarBottomLeftButton",
+	MULTIACTIONBAR2BUTTON = "MultiBarBottomRightButton",
+	MULTIACTIONBAR3BUTTON = "MultiBarRightButton",
+	MULTIACTIONBAR4BUTTON = "MultiBarLeftButton",
+}
+
+local ctrlHintOverlays = {}
+
+-- 把绑定动作串解析成屏幕上的按钮对象；解析不出返回 nil。
+local function ResolveCtrlHintButton(action)
+	if type(action) ~= "string" or action == "" then
+		return nil
+	end
+	-- Bartender4 等插件用 "CLICK BT4Button17:LeftButton" 的形式绑定自己的按钮
+	if string.find(string.upper(action), "CLICK ", 1, true) == 1 then
+		local buttonName = string.match(action, "^[%a]+%s+([^:]+)")
+		local button = buttonName and _G[buttonName]
+		if button then
+			return button
+		end
+		return nil
+	end
+	local upper = string.upper(action)
+	for bindingPrefix, framePrefix in pairs(CTRL_HINT_BUTTON_PREFIX) do
+		local index = string.match(upper, "^" .. bindingPrefix .. "(%d+)$")
+		if index then
+			-- 装了 Bartender4 后，ACTIONBUTTON1~12 会被它重定向到 BT4Button1~12，
+			-- 屏幕上真正显示的是 BT4 的按钮，所以优先取那个。
+			if bindingPrefix == "ACTIONBUTTON" and _G["BT4Button" .. index] then
+				return _G["BT4Button" .. index]
+			end
+			return _G[framePrefix .. index]
+		end
+	end
+	return nil
+end
+
+-- 为某个按钮创建（或复用）角标 + 描边的提示层。
+local function GetCtrlHintOverlay(button)
+	local overlay = ctrlHintOverlays[button]
+	if overlay then
+		return overlay
+	end
+	overlay = CreateFrame("Frame", nil, UIParent)
+	overlay:SetFrameStrata("DIALOG")
+	overlay:SetPoint("BOTTOMLEFT", button, "BOTTOMLEFT", 0, 0)
+	overlay:SetPoint("TOPRIGHT", button, "TOPRIGHT", 0, 0)
+	overlay:SetBackdrop({
+		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+		edgeSize = 10,
+		insets = { left = 1, right = 1, top = 1, bottom = 1 },
+	})
+	overlay:SetBackdropBorderColor(1, 0.82, 0, 1)
+	overlay:Hide()
+
+	-- 底部角标：半透明黑底 +「Ctrl+N」金字，宽度按文字自适应
+	-- （组合键如 Ctrl+Shift+1 比按钮还宽，会稍微溢出按钮，但不影响阅读）。
+	local badge = CreateFrame("Frame", nil, overlay)
+	badge:SetPoint("BOTTOM", overlay, "BOTTOM", 0, 1)
+	badge:SetHeight(13)
+	badge:SetWidth(30)
+	local bg = badge:CreateTexture(nil, "BACKGROUND")
+	bg:SetAllPoints(badge)
+	bg:SetTexture(0, 0, 0, 0.65)
+	local label = badge:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+	label:SetPoint("CENTER", badge, "CENTER", 0, 0)
+	label:SetTextColor(1, 0.85, 0.2)
+	overlay.label = label
+	overlay.badge = badge
+
+	ctrlHintOverlays[button] = overlay
+	return overlay
+end
+
+local function HideCtrlHints()
+	for _, overlay in pairs(ctrlHintOverlays) do
+		overlay.ctrlHit = nil
+		if overlay:IsShown() then
+			overlay:Hide()
+		end
+	end
+end
+
+-- ticker 记住的上一次生效前缀（nil 表示当前没有提示）。
+-- 提前声明，供 SetHintEnabled 重置，让开关切换能立刻生效。
+local ctrlHintActivePrefix = nil
+
+-- 轮询间隔（秒）。要跟手就得短：0.03 秒≈每帧一次，按下/松开修饰键后提示基本立刻响应。
+-- 空闲时每次轮询只调 3 个按键状态函数，开销可以忽略。
+local HINT_POLL_INTERVAL = 0.03
+
+-- 按钮暂时看不见时的宽限（秒）：切页 / 施放瞬间按钮会短暂隐藏，
+-- 这时先留着角标，超过这个时间才收，避免提示闪一下。
+local HINT_HIDE_DELAY = 0.15
+
+-- 按当前修饰键组合（prefix 形如 "CTRL-"、"ALT-SHIFT-"）刷新角标内容并显示。
+local function ShowCtrlHints(prefix, display)
+	for _, overlay in pairs(ctrlHintOverlays) do
+		overlay.ctrlHit = nil
+		overlay:Hide()
+	end
+	for i = 1, #CTRL_HINT_KEYS do
+		local number = CTRL_HINT_KEYS[i]
+		local button = ResolveCtrlHintButton(GetBindingAction(prefix .. number))
+		local action = button and button.action
+		-- 空格子不提示：按了组合键也没有技能可放。
+		if button and (action == nil or (type(action) == "number" and HasAction(action))) then
+			local overlay = GetCtrlHintOverlay(button)
+			overlay.ctrlHit = true
+			overlay.label:SetText(display .. "+" .. number)
+			overlay.badge:SetWidth(overlay.label:GetStringWidth() + 8)
+			overlay:SetAlpha(1)
+			if button:IsVisible() then
+				overlay:Show()
+			end
+		end
+	end
+end
+
+-- 当前按住的（且对应开关已启用的）修饰键 → 绑定前缀与显示名。
+-- 返回 nil 表示没有需要提示的修饰键；同时按住多个时按真实组合查询。
+local function GetActiveHintPrefix()
+	local prefix = ""
+	local display = nil
+	if ctrlHintEnabled and IsControlKeyDown() then
+		prefix = prefix .. "CTRL-"
+		display = "Ctrl"
+	end
+	if shiftHintEnabled and IsShiftKeyDown() then
+		prefix = prefix .. "SHIFT-"
+		display = display and (display .. "+Shift") or "Shift"
+	end
+	if altHintEnabled and IsAltKeyDown() then
+		prefix = prefix .. "ALT-"
+		display = display and (display .. "+Alt") or "Alt"
+	end
+	if prefix == "" then
+		return nil, nil
+	end
+	return prefix, display
+end
+
+-- kind: "ctrl" / "alt" / "shift"
+local function SetHintEnabled(kind, enabled)
+	enabled = enabled and true or false
+	if kind == "ctrl" then
+		ctrlHintEnabled = enabled
+	elseif kind == "alt" then
+		altHintEnabled = enabled
+	else
+		shiftHintEnabled = enabled
+	end
+	if MySteamlikeAssistantDB then
+		MySteamlikeAssistantDB[kind .. "HintEnabled"] = enabled
+	end
+	-- 让轮询立刻按新开关重算
+	ctrlHintActivePrefix = nil
+	HideCtrlHints()
+end
+
+-- 3.3.5 没有修饰键事件，用一个 OnUpdate 轮询修饰键状态（间隔见 HINT_POLL_INTERVAL）。
+-- 只在按下的组合变化时重建提示；按住期间同步可见性，切页 / 切姿态时提示跟着按钮走。
+-- 收起提示带小宽限，避免按住修饰键连按数字键时提示闪断。
+local ctrlHintTicker = CreateFrame("Frame", nil, UIParent)
+local ctrlHintCheckElapsed = 0
+ctrlHintTicker:SetScript("OnUpdate", function(_, elapsed)
+	ctrlHintCheckElapsed = ctrlHintCheckElapsed + elapsed
+	if ctrlHintCheckElapsed < HINT_POLL_INTERVAL then
+		return
+	end
+	local step = ctrlHintCheckElapsed
+	ctrlHintCheckElapsed = 0
+
+	local prefix, display = GetActiveHintPrefix()
+	if prefix ~= ctrlHintActivePrefix then
+		ctrlHintActivePrefix = prefix
+		if prefix then
+			ShowCtrlHints(prefix, display) -- 修饰键按下：立刻显示
+		else
+			HideCtrlHints() -- 修饰键松开：立刻收起
+		end
+		return
+	end
+
+	if not prefix then
+		return
+	end
+
+	-- 按住修饰键期间：按钮可见就显示提示；暂时看不见（切页、施放瞬间的刷新）先留着，
+	-- 超过宽限时间才收，这样按数字键放技能时提示不会消失或闪一下。
+	for button, overlay in pairs(ctrlHintOverlays) do
+		if overlay.ctrlHit then
+			if button:IsVisible() then
+				overlay.hiddenFor = nil
+				if not overlay:IsShown() then
+					overlay:SetAlpha(1)
+					overlay:Show()
+				end
+			else
+				overlay.hiddenFor = (overlay.hiddenFor or 0) + step
+				if overlay.hiddenFor >= HINT_HIDE_DELAY and overlay:IsShown() then
+					overlay:Hide()
+				end
+			end
+		end
+	end
+end)
+ctrlHintTicker:Show()
+
+------------------------------------------------------------------
 -- 设置面板（Esc → 界面 → MySteamlikeAssistant）
 ------------------------------------------------------------------
 -- 3.3.5a 没有独立的“插件”标签页，插件设置是用 InterfaceOptions_AddCategory
@@ -940,11 +1182,54 @@ cbDebug:SetScript("OnClick", function(self)
 	Print("调试日志已" .. (debugEnabled and "开启" or "关闭"))
 end)
 
+-- 组合键提示的三个独立开关：横排一行，省纵向空间，也不会和下面的文字重叠。
+-- 勾选框保持模板原样（不要放大框体，模板的勾选纹理会被拉成长方形），
+-- 鼠标提示改用暴雪设置面板的默认锚点（屏幕右下），不会压在勾选框或旁边的文字上。
+local function CreateHintCheckButton(name, labelText, tooltip, kind)
+	local cb = CreateFrame("CheckButton", name, optionsPanel, "InterfaceOptionsCheckButtonTemplate")
+	_G[name .. "Text"]:SetText(labelText)
+	cb.tooltipText = tooltip
+	cb:SetScript("OnEnter", function(self)
+		GameTooltip_SetDefaultAnchor(GameTooltip, self)
+		GameTooltip:SetText(self.tooltipText, 1, 1, 1, 1, true)
+		GameTooltip:Show()
+	end)
+	cb:SetScript("OnLeave", function()
+		GameTooltip:Hide()
+	end)
+	cb:SetScript("OnClick", function(self)
+		SetHintEnabled(kind, self:GetChecked())
+		Print("组合键提示（" .. labelText .. "）已" .. (self:GetChecked() and "开启" or "关闭"))
+	end)
+	return cb
+end
+
+-- 分类说明：与三个勾选框同一行（写在左侧），不额外占纵向空间。
+-- 行首留出「说明文字宽度 + 10」的缩进，三个勾选框从那里开始排。
+local hintTitle = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontNormal")
+hintTitle:SetText("组合键提示：")
+local hintIndent = hintTitle:GetStringWidth() + 10
+
+local cbHintCtrl = CreateHintCheckButton("MSA_CB_HintCtrl", "Ctrl",
+	"按住 Ctrl 时，在绑定了 Ctrl+1 ~ Ctrl+0 的动作按钮上浮出角标并描边。只读展示，不改动按键绑定。", "ctrl")
+cbHintCtrl:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", hintIndent, -4)
+hintTitle:SetPoint("LEFT", cbHintCtrl, "LEFT", -hintIndent, 0)
+
+-- 三个勾选框按各自文字的实际宽度依次排开，互不重叠。
+local cbHintAlt = CreateHintCheckButton("MSA_CB_HintAlt", "Alt",
+	"按住 Alt 时，在绑定了 Alt+1 ~ Alt+0 的动作按钮上浮出角标并描边。只读展示，不改动按键绑定。", "alt")
+cbHintAlt:SetPoint("LEFT", _G["MSA_CB_HintCtrlText"], "RIGHT", 18, 0)
+
+local cbHintShift = CreateHintCheckButton("MSA_CB_HintShift", "Shift",
+	"按住 Shift 时，在绑定了 Shift+1 ~ Shift+0 的动作按钮上浮出角标并描边。只读展示，不改动按键绑定。", "shift")
+cbHintShift:SetPoint("LEFT", _G["MSA_CB_HintAltText"], "RIGHT", 18, 0)
+
 -- 只读展示：两个按键当前的绑定状态。
 -- 只显示“已生效/未生效”，不显示底层动作串（如 CLICK ...:LeftButton），
 -- 避免文字过长顶出面板边框；同时加右锚点，万一超长也能在面板内换行。
+-- 横向用 -hintIndent 抵消缩进，让状态行与上方的开关左对齐。
 local bindText = optionsPanel:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
-bindText:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", 0, -10)
+bindText:SetPoint("TOPLEFT", cbHintCtrl, "BOTTOMLEFT", -hintIndent, -6)
 bindText:SetPoint("RIGHT", optionsPanel, "RIGHT", -16, 0)
 bindText:SetJustifyH("LEFT")
 
@@ -980,6 +1265,7 @@ cmdText:SetText(
 	.. "/msa skull - 标记骷髅开关  /msa wasd - 移动自动锁视角\n"
 	.. "/msa start / stop - 手动开启 / 关闭鼠标视角\n"
 	.. "/msa debug / diag - 调试日志 / 临时诊断\n"
+	.. "/msa ctrl|alt|shift - 开/关对应修饰键的组合提示\n"
 	.. "/msa rebind - 重新挂载并持久化绑定\n"
 	.. "/msa chat - 聊天布局存档：save 保存 / load 应用 / auto 自动"
 )
@@ -1070,6 +1356,9 @@ optionsPanel:SetScript("OnShow", function()
 	cbSkull:SetChecked(skullEnabled)
 	cbWASD:SetChecked(wasdAutoLock)
 	cbDebug:SetChecked(debugEnabled)
+	cbHintCtrl:SetChecked(ctrlHintEnabled)
+	cbHintAlt:SetChecked(altHintEnabled)
+	cbHintShift:SetChecked(shiftHintEnabled)
 	cbChatAuto:SetChecked(chatAutoApply)
 	RefreshKeyText()
 	UIDropDownMenu_SetText(iconDropdown, SKULL_ICON_NAMES[skullIcon])
@@ -1102,6 +1391,7 @@ local function ShowHelp()
 	Print("  /msa skull      开/关「标记骷髅」（默认关闭，按键在设置面板里录制）")
 	Print("  /msa wasd       开/关「移动自动锁视角」（默认关闭）")
 	Print("  /msa debug      开/关调试日志")
+	Print("  /msa ctrl|alt|shift  开/关对应修饰键的组合提示（按住该键显示 +数字 角标）")
 	Print("  /msa diag       开/关临时诊断（打印客户端内部的鼠标状态，排查输入问题用）")
 	Print("  /msa chat       查看聊天窗口布局存档状态")
 	Print("  /msa chat save  保存当前聊天窗口布局（位置 / 尺寸 / 锁定 / 字号）")
@@ -1152,6 +1442,12 @@ SlashCmdList["MYSTEAMLIKEASSISTANT"] = function(msg)
 		debugEnabled = not debugEnabled
 		if MySteamlikeAssistantDB then MySteamlikeAssistantDB.debugEnabled = debugEnabled end
 		Print("调试日志已" .. (debugEnabled and "开启" or "关闭"))
+	elseif msg == "ctrl" or msg == "alt" or msg == "shift" then
+		local enabled = (msg == "ctrl" and ctrlHintEnabled)
+			or (msg == "alt" and altHintEnabled)
+			or (msg == "shift" and shiftHintEnabled)
+		SetHintEnabled(msg, not enabled)
+		Print("组合键提示（" .. msg .. "）已" .. (not enabled and "开启" or "关闭"))
 	elseif msg == "diag" then
 		ToggleDiag()
 	elseif msg == "chat" then
@@ -1220,6 +1516,9 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 		if d.skullKey == nil or d.skullKey == "" then d.skullKey = SKULL_DEFAULT_KEY end
 		if d.skullIcon == nil or not SKULL_ICON_NAMES[d.skullIcon] then d.skullIcon = SKULL_ICON_DEFAULT end
 		if d.chatAutoApply == nil then d.chatAutoApply = false end
+		if d.ctrlHintEnabled == nil then d.ctrlHintEnabled = true end
+		if d.altHintEnabled == nil then d.altHintEnabled = true end
+		if d.shiftHintEnabled == nil then d.shiftHintEnabled = true end
 		keyMappingEnabled = d.keyMappingEnabled
 		wasdAutoLock = d.wasdAutoLock
 		debugEnabled = d.debugEnabled
@@ -1227,6 +1526,9 @@ frame:SetScript("OnEvent", function(self, event, arg1)
 		skullKey = d.skullKey
 		skullIcon = d.skullIcon
 		chatAutoApply = d.chatAutoApply
+		ctrlHintEnabled = d.ctrlHintEnabled
+		altHintEnabled = d.altHintEnabled
+		shiftHintEnabled = d.shiftHintEnabled
 		self:UnregisterEvent("ADDON_LOADED")
 	elseif event == "PLAYER_LOGIN" then
 		-- 此刻按键表已加载完成，挂载绑定时机最稳；随后做一次自检。

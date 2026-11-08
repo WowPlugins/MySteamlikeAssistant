@@ -4,7 +4,7 @@
 ## Notes: F11/F12 mouselook (off by default), plus a raid-mark key (icon 1-8, default 8/skull)
 ## Notes-zhCN: F11/F12 控制鼠标视角（默认关闭），另有可设按键与编号(1-8)的团队标记功能（默认关闭）
 ## Author:
-## Version: 1.4.1
+## Version: 1.6.0
 ## X-Category: 界面
 ## SavedVariables: MySteamlikeAssistantDB
 
