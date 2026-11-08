@@ -19,7 +19,7 @@
 --   让相机跟随角色移动。实现方式见下方“移动自动锁视角”一节。
 --
 --   另外提供一个「组合键提示」功能（Ctrl / Alt / Shift 各自独立开关，默认全开）：
---   按住修饰键时，在绑定了对应组合（+1 ~ +0）的动作条按钮上浮出「Ctrl+N」角标
+--   按住修饰键时，在绑定了对应组合（+1 ~ +0）的动作条按钮上浮出「Ctrl1」小角标
 --   并描一圈亮边，松开即消失；只读展示，不改动任何按键绑定。
 --
 -- 原理：
@@ -847,8 +847,7 @@ local function GetCtrlHintOverlay(button)
 	overlay:SetBackdropBorderColor(1, 0.82, 0, 1)
 	overlay:Hide()
 
-	-- 底部角标：半透明黑底 +「Ctrl+N」金字，宽度按文字自适应
-	-- （组合键如 Ctrl+Shift+1 比按钮还宽，会稍微溢出按钮，但不影响阅读）。
+	-- 底部角标：半透明黑底 + 金字，内容如「Ctrl1」「Alt3」「Sh5」（修饰键用简写，尽量窄）。
 	local badge = CreateFrame("Frame", nil, overlay)
 	badge:SetPoint("BOTTOM", overlay, "BOTTOM", 0, 1)
 	badge:SetHeight(13)
@@ -901,8 +900,9 @@ local function ShowCtrlHints(prefix, display)
 		if button and (action == nil or (type(action) == "number" and HasAction(action))) then
 			local overlay = GetCtrlHintOverlay(button)
 			overlay.ctrlHit = true
-			overlay.label:SetText(display .. "+" .. number)
-			overlay.badge:SetWidth(overlay.label:GetStringWidth() + 8)
+			overlay.label:SetText(display .. number)
+			-- 角标宽度按文字自适应，左右各留 3px，尽量窄，避免盖住相邻按钮。
+			overlay.badge:SetWidth(overlay.label:GetStringWidth() + 6)
 			overlay:SetAlpha(1)
 			if button:IsVisible() then
 				overlay:Show()
@@ -922,7 +922,7 @@ local function GetActiveHintPrefix()
 	end
 	if shiftHintEnabled and IsShiftKeyDown() then
 		prefix = prefix .. "SHIFT-"
-		display = display and (display .. "+Shift") or "Shift"
+		display = display and (display .. "+Sh") or "Sh"
 	end
 	if altHintEnabled and IsAltKeyDown() then
 		prefix = prefix .. "ALT-"
