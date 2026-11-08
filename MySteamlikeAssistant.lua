@@ -1183,11 +1183,24 @@ cbDebug:SetScript("OnClick", function(self)
 end)
 
 -- 组合键提示的三个独立开关：横排一行，省纵向空间，也不会和下面的文字重叠。
--- 勾选框保持模板原样（不要放大框体，模板的勾选纹理会被拉成长方形），
+-- 勾选框尺寸统一成正方形（宽 = 模板高度），文字锚在框体右侧，命中区再扩到文字末尾：
+-- 这样点方块、点文字都能切换，且不会侵入旁边的勾选框。
 -- 鼠标提示改用暴雪设置面板的默认锚点（屏幕右下），不会压在勾选框或旁边的文字上。
+local HINT_LABEL_GAP = 4
 local function CreateHintCheckButton(name, labelText, tooltip, kind)
 	local cb = CreateFrame("CheckButton", name, optionsPanel, "InterfaceOptionsCheckButtonTemplate")
-	_G[name .. "Text"]:SetText(labelText)
+	-- 不同客户端里这个模板的框体宽度不一致（有的把文字宽度也算进框体，导致相邻勾选框的
+	-- 框体互相覆盖：点 Alt 实际点到 Ctrl）。统一把框体裁成正方形，只覆盖勾选方块本身。
+	cb:SetWidth(cb:GetHeight())
+	local label = _G[name .. "Text"]
+	label:ClearAllPoints()
+	label:SetPoint("LEFT", cb, "RIGHT", HINT_LABEL_GAP, 0)
+	label:SetText(labelText)
+	-- 模板默认只有方块可点，这里把命中区向右扩到文字末尾（扩出的范围严格等于文字宽度）。
+	local labelWidth = label:GetStringWidth()
+	cb:SetHitRectInsets(0, -(HINT_LABEL_GAP + labelWidth + 2), 0, 0)
+	-- 本控件实际占用的横向宽度，供下一个勾选框定位使用（方块 + 间距 + 文字）。
+	cb.hintSpan = cb:GetWidth() + HINT_LABEL_GAP + labelWidth
 	cb.tooltipText = tooltip
 	cb:SetScript("OnEnter", function(self)
 		GameTooltip_SetDefaultAnchor(GameTooltip, self)
@@ -1215,14 +1228,16 @@ local cbHintCtrl = CreateHintCheckButton("MSA_CB_HintCtrl", "Ctrl",
 cbHintCtrl:SetPoint("TOPLEFT", cbDebug, "BOTTOMLEFT", hintIndent, -4)
 hintTitle:SetPoint("LEFT", cbHintCtrl, "LEFT", -hintIndent, 0)
 
--- 三个勾选框按各自文字的实际宽度依次排开，互不重叠。
+-- 三个勾选框按「方块 + 文字」的实际宽度依次排开（间距 18），位置用数值算，
+-- 不再锚到上一个勾选框的文字上，避免模板差异导致框体错位、点击串到别的开关。
+local HINT_SWITCH_GAP = 18
 local cbHintAlt = CreateHintCheckButton("MSA_CB_HintAlt", "Alt",
 	"按住 Alt 时，在绑定了 Alt+1 ~ Alt+0 的动作按钮上浮出角标并描边。只读展示，不改动按键绑定。", "alt")
-cbHintAlt:SetPoint("LEFT", _G["MSA_CB_HintCtrlText"], "RIGHT", 18, 0)
+cbHintAlt:SetPoint("TOPLEFT", cbHintCtrl, "TOPLEFT", cbHintCtrl.hintSpan + HINT_SWITCH_GAP, 0)
 
 local cbHintShift = CreateHintCheckButton("MSA_CB_HintShift", "Shift",
 	"按住 Shift 时，在绑定了 Shift+1 ~ Shift+0 的动作按钮上浮出角标并描边。只读展示，不改动按键绑定。", "shift")
-cbHintShift:SetPoint("LEFT", _G["MSA_CB_HintAltText"], "RIGHT", 18, 0)
+cbHintShift:SetPoint("TOPLEFT", cbHintAlt, "TOPLEFT", cbHintAlt.hintSpan + HINT_SWITCH_GAP, 0)
 
 -- 只读展示：两个按键当前的绑定状态。
 -- 只显示“已生效/未生效”，不显示底层动作串（如 CLICK ...:LeftButton），
