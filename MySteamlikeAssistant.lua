@@ -19,7 +19,7 @@
 --   让相机跟随角色移动。实现方式见下方“移动自动锁视角”一节。
 --
 --   另外提供一个「组合键提示」功能（Ctrl / Alt / Shift 单键，以及 Ctrl+Alt、Ctrl+Shift
---   两个组合，各自独立开关，默认全开）：按住修饰键时，在绑定了对应组合（+1 ~ +0）
+--   两个组合，各自独立开关，默认全开）：按住修饰键时，在绑定了对应组合（数字 / 字母等任意键）
 --   的动作条按钮上浮出「Ctrl1」小角标并描一圈亮边，松开即消失；只读展示，不改动任何按键绑定。
 --
 -- 原理：
@@ -84,7 +84,7 @@ local SKULL_ICON_NAMES = {
 -- **默认关闭**，可在设置面板勾选，或用 /msa chat auto 切换。
 local chatAutoApply = false
 
--- 「组合键提示」开关：按住 Ctrl / Alt / Shift 时，在绑定了对应组合（+1 ~ +0）的
+-- 「组合键提示」开关：按住 Ctrl / Alt / Shift 时，在绑定了对应组合（数字 / 字母等任意键）的
 -- 动作条按钮上浮出「Ctrl1」角标并描边，松开即消失。只读展示，不改动任何按键绑定。
 -- 三个单键修饰符各有一个开关，另有两个组合开关（Ctrl+Alt、Ctrl+Shift），**默认全部开启**；
 -- 可在设置面板勾选，或用 /msa ctrl、/msa alt、/msa shift、/msa ctrlalt、/msa ctrlshift 切换。
@@ -781,14 +781,45 @@ end
 ------------------------------------------------------------------
 -- 组合键提示（按住 Ctrl / Alt / Shift 时标出绑定了对应组合的动作条按钮）
 ------------------------------------------------------------------
--- 用途：有些按键是 Ctrl+1 ~ Ctrl+8、Alt+1 ~ Alt+8 这类组合键，平时动作条上
+-- 用途：有些按键是 Ctrl+1、Alt+Q 这类组合键，平时动作条上
 -- 只显示 1~8，记不住某个组合对应哪一格。按住修饰键时在对应按钮上浮出
 -- 「Ctrl+N」角标并描一圈亮边，松开即消失；只读展示，不改动任何按键绑定。
 -- 同时按住多个修饰键时按真实组合查询（例如 Ctrl+Shift+1 -> "CTRL-SHIFT-1"）。
 -- 兼容原版动作条与 Bartender4（BT4 的按钮是 BT4ButtonN，绑定动作形如 CLICK ...）。
 --
--- 参与提示的数字键（+1 ~ +9 与 +0）。
-local CTRL_HINT_KEYS = { "1", "2", "3", "4", "5", "6", "7", "8", "9", "0" }
+-- 参与提示的按键：动作条上常见的可绑定键。
+-- 数字 / 字母 / F1~F12 / 符号 / 小键盘 / 方向键 / 编辑键都查，
+-- 这样 Alt+Q、Ctrl+F 这类自定义组合也能提示（原先只查 1~0）。
+local CTRL_HINT_KEYS = {
+	"1", "2", "3", "4", "5", "6", "7", "8", "9", "0",
+	"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+	"N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+	"F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+	"`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
+	"NUMPAD0", "NUMPAD1", "NUMPAD2", "NUMPAD3", "NUMPAD4",
+	"NUMPAD5", "NUMPAD6", "NUMPAD7", "NUMPAD8", "NUMPAD9",
+	"UP", "DOWN", "LEFT", "RIGHT",
+	"INSERT", "DELETE", "HOME", "END", "PAGEUP", "PAGEDOWN", "SPACE", "TAB",
+}
+
+-- 长键名的角标简写，避免「AltNUMPAD7」这种把角标撑得很宽。
+local CTRL_HINT_KEY_LABELS = {
+	UP = "Up", DOWN = "Dn", LEFT = "Lt", RIGHT = "Rt",
+	INSERT = "Ins", DELETE = "Del", HOME = "Home", END = "End",
+	PAGEUP = "PgUp", PAGEDOWN = "PgDn", SPACE = "Spc", TAB = "Tab",
+}
+
+local function HintKeyLabel(key)
+	local label = CTRL_HINT_KEY_LABELS[key]
+	if label then
+		return label
+	end
+	local numpad = string.match(key, "^NUMPAD(%d)$")
+	if numpad then
+		return "N" .. numpad
+	end
+	return key
+end
 
 -- 原生动作条的绑定命令前缀 → 按钮名前缀（3.3.5 的绑定名是全大写）。
 local CTRL_HINT_BUTTON_PREFIX = {
@@ -899,10 +930,10 @@ local function ShowCtrlHints(prefixes, display)
 		overlay:Hide()
 	end
 	for i = 1, #CTRL_HINT_KEYS do
-		local number = CTRL_HINT_KEYS[i]
+		local key = CTRL_HINT_KEYS[i]
 		local button
 		for p = 1, #prefixes do
-			local candidate = ResolveCtrlHintButton(GetBindingAction(prefixes[p] .. number))
+			local candidate = ResolveCtrlHintButton(GetBindingAction(prefixes[p] .. key))
 			if candidate then
 				local action = candidate.action
 				-- 空格子不提示：按了组合键也没有技能可放。
@@ -915,7 +946,7 @@ local function ShowCtrlHints(prefixes, display)
 		if button then
 			local overlay = GetCtrlHintOverlay(button)
 			overlay.ctrlHit = true
-			overlay.label:SetText(display .. number)
+			overlay.label:SetText(display .. HintKeyLabel(key))
 			-- 角标宽度按文字自适应，左右各留 3px，尽量窄，避免盖住相邻按钮。
 			overlay.badge:SetWidth(overlay.label:GetStringWidth() + 6)
 			overlay:SetAlpha(1)
